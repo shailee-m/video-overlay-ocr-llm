@@ -1,0 +1,184 @@
+const fs = require("fs-extra");
+const path = require("path");
+const util = require("util");
+const textToSpeech = require("@google-cloud/text-to-speech");
+const ffmpeg = require("fluent-ffmpeg");
+
+const client = new textToSpeech.TextToSpeechClient();
+
+// Define your Gujarati segments here
+const segments = [
+  {
+    text: "18 ટકા ને ડેસિમલ અને અનુકૂળરૂપ ફ્રેક્શનમાં કેવી રીતે લખવું તે શીખીએ.",
+    speed: 0.921659,
+  },
+  {
+    text: "તો પહેલાં તેને ડેસિમલ રૂપમાં ફેરવી જોઈએ.",
+    speed: 0.614439,
+  },
+  {
+    text: "18 ટકા એટલે 100 માંથી 18 ભાગ થાય. અહીં હું “ટકા” શબ્દને અલગ કરીને સમજાવું છું.",
+    speed: 1.316656,
+  },
+  {
+    text: "સામાન્ય રીતે આ એક શબ્દ તરીકે લખાય છે, પણ હું તેને સ્પષ્ટ સમજાવવા માટે “પ્રતિ સો” તરીકે અલગ રીતે લઈ રહ્યો છું.",
+    speed: 0.844854,
+  },
+  {
+    text: "“સેંટ” નો અર્થ સો થાય છે, એટલે 18 ટકા નો અર્થ થયો — 18 પ્રતિ સો.",
+    speed: 1.075269,
+  },
+  {
+    text: "સાચું કહું તો હું પહેલું ડેસિમલ કરવાનું કહેલું, પણ ચાલો ફ્રેક્શનથી શરૂ કરીએ.",
+    speed: 0.875431,
+  },
+  {
+    text: "18 પ્રતિ સો એટલે ફ્રેક્શન રૂપે સીધું 18/100.",
+    speed: 0.888848,
+  },
+  {
+    text: "એટલે હમણાં આપણે ફ્રેક્શન પહેલું લઈ રહ્યા છીએ.",
+    speed: 0.921659,
+  },
+  {
+    text: "આનો અર્થ છે 100 માંથી 18 ભાગ, જેને આપણે “18 હન્ડ્રેડ્થ્સ” પણ કહી શકીએ.",
+    speed: 1.019485,
+  },
+  {
+    text: "હવે, આપણે ઈચ્છીએ તો અહીંથી સીધું ડેસિમલમાં લઈ જઈ શકીએ, અથવા આ ફ્રેક્શનને સરળરૂપમાં પણ ફેરવી શકીએ.",
+    speed: 1.269485,
+  },
+  {
+    text: "તો હવે પહેલાં ડેસિમલ કરીએ, કારણ કે શરૂમાં એ જ કહેલું હતું. ચાલો એજ કરીએ.",
+    speed: 1.019485,
+  },
+  {
+    text: "તો 18 હન્ડ્રેડ્થ્સ એટલે 0.18, અને આપણે જાણીએ છીએ કે આને ડેસિમલમાં કેવી રીતે લખવું.",
+    speed: 1.121657,
+  },
+  {
+    text: "એટલે 0.18. તમે તેને 1 દશાંશ અને 8 સોથીયાંશ તરીકે જોઈ શકો, કે પછી 10 અને 8 સોથીયાંશ — એટલે 18 સોથીયાંશ.",
+    speed: 1.317948,
+  },
+  {
+    text: "તો હવે આપણને મળ્યું ડેસિમલ રૂપ. અને જો આપણે તેને ફ્રેક્શન રૂપે સરળ બનાવવું હોય, તો પહેલા જોઈએ કે 18 અને 100 માટે કોઈ સામાન્ય ગુણાકારક છે કે નહીં.",
+    speed: 1.285142,
+  },
+  {
+    text: "બંને સંખ્યાઓ જોડી છે એટલે બંને 2 થી વિભાજ્ય છે. તો ચાલો બંને સંખ્યાઓને 2 થી ભાગીએ.",
+    speed: 1.172349,
+  },
+  {
+    text: "તો હવે આપણે કરીએ 18 ÷ 2 અને 100 ÷ 2, એટલે મળ્યું 9 ઉપર અને નીચે 50.",
+    speed: 1.319354,
+  },
+  {
+    text: "100 ÷ 2 = 50 થાય છે, અને હવે આ બંને વચ્ચે કોઈ સામાન્ય ગુણાકારક રહ્યો નથી.",
+    speed: 1.269485,
+  },
+  {
+    text: "50, 3 થી ભાગાતું નથી. 9 માત્ર 1, 3 અને 9 થી ભાગાય છે. એટલે આ સરળ ફ્રેક્શન છે: 9/50.",
+    speed: 1.269485,
+  },
+  {
+    text: "એટલે 18 ટકા = 0.18 = 9/50 — આ ત્રણેય એકજ અર્થ આપે છે.",
+    speed: 1.019485,
+  },
+  {
+    text: "હાં, મેં બધું વિગતવાર બતાવ્યું કારણ કે “ટકા” નો મૂળ અર્થ — “પ્રતિ સો” — સમજો તો બધું સરળ બને છે.",
+    speed: 1.09472,
+  },
+  {
+    text: "પણ જો ભવિષ્યમાં આવા પ્રશ્નો આવે, તો ઝડપી રીત એ છે કે...",
+    speed: 0.844854,
+  },
+  {
+    text: "... “18 ટકા” એટલે સીધું 18/100 — ટકાની આગળ જે સંખ્યા હોય એ ઉપર, અને નીચે હમેશાં 100.",
+    speed: 1.269485,
+  },
+  {
+    text: "આને તમે 18.0 ટકા તરીકે પણ જોઈ શકો, એટલે એજ વાત છે — 18 ટકા.",
+    speed: 1.019485,
+  },
+  {
+    text: "જ્યારે ડેસિમલમાં ફેરવવી હોય ત્યારે માત્ર .0 ઉમેરેલું છે જેથી તમે પોઈન્ટ સ્પષ્ટ જોઈ શકો.",
+    speed: 1.019485,
+  },
+  {
+    text: "અને હવે જો તમારે ટકાના બદલે ડેસિમલ લખવું હોય, તો પોઈન્ટને ડાબી બાજુએ બે અંકો ખસેડો.",
+    speed: 1.019485,
+  },
+  {
+    text: "એટલે જો પોઈન્ટ બે સ્થાન ડાબી બાજુ ખસેડો તો આવે: 0.18, એટલે 0.18.",
+    speed: 1.121657,
+  },
+  {
+    text: "અથવા તમે સીધું કહી શકો કે 18 ટકા એટલે 18/100 અને તેને સરળરૂપમાં લખીએ તો 9/50 થાય.",
+    speed: 1.019485,
+  },
+  {
+    text: "અને આપણે જોયું જ છે કે 18/100 એ 18 હન્ડ્રેડ્થ્સ છે, એટલે કે 0.18.",
+    speed: 1.019485,
+  },
+  {
+    text: "આશા છે કે આ સમજાવટથી તમને સ્પષ્ટતા મળી હશે અને તમારું ધ્યાન ભટક્યું નહીં હોય.",
+    speed: 1.019485,
+  },
+  {
+    text: "(આ વિડિઓનું ટ્રાન્સક્રિપ્શન TurboScribe.ai દ્વારા થયું છે. Sandesh subscription લેતાં આ સંદેશ દૂર થાય છે.)",
+    speed: 1.019485,
+  },
+];
+
+const outputDir = path.join(__dirname, "tts_output");
+const outputFile = path.join(__dirname, "final_audio.mp3");
+
+async function synthesizeSegment(text, speed, index) {
+  const request = {
+    input: { text },
+    voice: {
+      languageCode: "gu-IN",
+      //   customVoice: "gu-IN-chirp3-HD-Archid",
+      VoiceSelectionParams: 1,
+    },
+    audioConfig: {
+      audioEncoding: "MP3",
+      speakingRate: speed,
+    },
+  };
+
+  const [response] = await client.synthesizeSpeech(request);
+  const filePath = path.join(outputDir, `segment_${index}.mp3`);
+  await fs.writeFile(filePath, response.audioContent, "binary");
+  console.log(`Saved: segment_${index}.mp3`);
+  return filePath;
+}
+
+async function mergeSegments(files) {
+  return new Promise((resolve, reject) => {
+    const ffmpegCommand = ffmpeg();
+    files.forEach((file) => ffmpegCommand.input(file));
+    ffmpegCommand
+      .on("error", reject)
+      .on("end", () => {
+        console.log("✅ Final audio created:", outputFile);
+        resolve();
+      })
+      .mergeToFile(outputFile, path.join(__dirname, "temp"));
+  });
+}
+
+async function run() {
+  await fs.ensureDir(outputDir);
+  const allFiles = [];
+
+  for (let i = 0; i < segments.length; i++) {
+    const { text, speed } = segments[i];
+    const file = await synthesizeSegment(text, speed, i);
+    allFiles.push(file);
+  }
+
+  await mergeSegments(allFiles);
+}
+
+run().catch(console.error);

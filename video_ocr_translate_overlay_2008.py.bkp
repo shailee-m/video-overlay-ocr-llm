@@ -1,0 +1,861 @@
+#!/usr/bin/env python3
+# video_ocr_phrase_overlay.py
+
+import os, sys, json, math, hashlib, shutil
+from typing import List, Dict, Tuple
+from concurrent.futures import ThreadPoolExecutor
+import cv2
+from tqdm import tqdm
+from paddleocr import PaddleOCR
+from PIL import Image, ImageDraw, ImageFont, ImageFile, Image as PILImage
+from mmocr.apis import MMOCRInferencer as TextInferencer
+
+from moviepy import ImageSequenceClip, AudioFileClip
+from skimage.metrics import structural_similarity as ssim
+import cv2, numpy as np
+from typing import List, Dict, Tuple, Optional
+from tqdm import tqdm
+
+
+# Optional: Google Gemini translate. If not configured, falls back to identity translation.
+try:
+    from google import genai
+    _GENAI_AVAILABLE = True
+except Exception:
+    _GENAI_AVAILABLE = False
+
+# =========================
+# Config
+# =========================
+OUTPUT_FPS = 10
+BG_RGBA = (0, 0, 0, 255)   # BLACK background color for overlays (R,G,B,A)
+# BG_RGBA = (0, 100, 0, 255)   # GREEN background color for overlays (R,G,B,A)
+DEFAULT_FONT_PATHS = [
+    "/usr/share/fonts/truetype/noto/NotoSansGujarati-Regular.ttf"
+]
+
+GEMINI_API_KEY = ""  # Replace with your actual Gemini API Key
+
+# =========================
+# Frame Extraction
+# =========================
+def extract_frames(video_path: str, frames_dir: str, fps: int = OUTPUT_FPS) -> List[str]:
+    if os.path.exists(frames_dir):
+        frames = []
+        for filename in os.listdir(frames_dir):
+            frames.append(os.path.join(frames_dir, filename))
+        frames.sort(key=lambda x: x)
+        return frames
+    os.makedirs(frames_dir, exist_ok=True)
+    cap = cv2.VideoCapture(video_path)
+    in_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not in_fps or in_fps <= 0:
+        in_fps = fps
+    interval = max(1, int(in_fps // fps))
+    frame_idx = 0
+    save_idx = 0
+    frames = []
+    print("Extracting frames...")
+    while True:
+        ok, img = cap.read()
+        if not ok:
+            break
+        if frame_idx % interval == 0:
+            outp = os.path.join(frames_dir, f"frame_{save_idx:05d}.png")
+            # img_fp = prep_board(img)
+            # cv2.imwrite(outp, img_fp)
+            cv2.imwrite(outp, img)
+            frames.append(outp)
+            save_idx += 1
+        frame_idx += 1
+    cap.release()
+    print(f"Extracted {len(frames)} frames.")
+    return frames
+
+# =========================
+# OCR Helpers
+# =========================
+def extract_texts_and_boxes(result) -> List[Tuple[str, Tuple[int,int,int,int], float]]:
+    """
+    Normalizes PaddleOCR result into:
+      [(text, (x1,y1,x2,y2), score), ...]
+    Handles both list-output and dict-output styles.
+    """
+    output = []
+    result_json = result[0].json['res']
+    res = result_json
+    texts = res.get("rec_texts", [])
+    boxes = res.get("rec_boxes", [])
+    scores = res.get("rec_scores", [])
+    for text, box, score in zip(texts, boxes, scores):
+        # box shape: (4, 2) [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+        if score >= 0.75:
+            x1, y1, x2, y2 = map(int, box)
+            output.append((text, [int(x1), int(y1), int(x2), int(y2)], float(score)))
+    return output
+    # out = []
+    # # Dict style.0.
+    #     scores = res.get("rec_scores", [1.0] * len(texts))
+    #     for t, b, sc in zip(texts, boxes, scores):
+    #         # b might be [x1,y1,x2,y2], or 4x2
+    #         if isinstance(b, (list, tuple)) and len(b) == 4 and all(isinstance(v, (int,float)) for v in b):
+    #             x1, y1, x2, y2 = map(int, b)
+    #         elif isinstance(b, (list, tuple)) and len(b) == 4 and all(isinstance(pt, (list,tuple)) and len(pt)==2 for pt in b):
+    #             xs = [pt[0] for pt in b]; ys = [pt[1] for pt in b]
+    #             x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+    #         else:
+    #             continue
+    #         out.append((t, (x1,y1,x2,y2), float(sc)))
+    #     return out
+
+    # # List style (most common)
+    # if isinstance(result, list) and len(result) > 0:
+    #     for line in result[0]:
+    #         bbox = line[0]
+    #         text, score = line[1]
+    #         if isinstance(bbox, (list,tuple)) and len(bbox)==4 and all(isinstance(v,(int,float)) for v in bbox):
+    #             x1,y1,x2,y2 = map(int, bbox)
+    #         elif isinstance(bbox, (list,tuple)) and len(bbox)==4 and all(isinstance(pt,(list,tuple)) and len(pt)==2 for pt in bbox):
+    #             xs = [pt[0] for pt in bbox]; ys = [pt[1] for pt in bbox]
+    #             x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+    #         else:
+    #             continue
+    #         out.append((text, (x1,y1,x2,y2), float(score)))
+    # return out
+
+
+
+
+# def process_frame(idx_fp, temp_dir_path):
+#     idx, fp, ocr = idx_fp
+#     try:
+#         temp_path = os.path.join(temp_dir_path, f"{idx}.json")
+#         if os.path.exists(temp_path):
+#             return idx
+
+#         raw = ocr.ocr(fp)
+#         tabs = extract_texts_and_boxes(raw)
+#         result = {
+#             "frame_index": idx,
+#             "frame_filename": os.path.basename(fp),
+#             "texts": [t[0] for t in tabs],
+#             "boxes": [t[1] for t in tabs],
+#             "scores": [t[2] for t in tabs]
+#         }
+#     except Exception:
+#         print(f"Error processing frame {idx} ({fp}): {sys.exc_info()[1]}")
+#         result = {
+#             "frame_index": idx,
+#             "frame_filename": os.path.basename(fp),
+#             "texts": [],
+#             "boxes": [],
+#             "scores": []
+#         }
+
+#     # Write to a temp JSON file immediately
+#     temp_path = os.path.join(temp_dir_path, f"{idx}.json")
+#     with open(temp_path, "w", encoding="utf-8") as f:
+#         json.dump(result, f, ensure_ascii=False)
+
+#     return idx  # Return only index for progress tracking
+
+
+# def run_or_load_ocr_ordered(frames: List[str], ocr, cache_path: str, temp_dir_path: str) -> List[Dict]:
+#     if os.path.exists(cache_path):
+#         print(f"Loading OCR cache: {cache_path}")
+#         with open(cache_path, "r", encoding="utf8") as f:
+#             return json.load(f)
+
+#     print("Running OCR on all frames (4 threads, temp writes)...")
+
+#     os.makedirs(temp_dir_path, exist_ok=True)
+
+#     # Run OCR in parallel and write temp results
+#     with ThreadPoolExecutor(max_workers=1) as executor:
+#         list(tqdm(
+#             executor.map(process_frame, [(i, fp, ocr) for i, fp in enumerate(frames)],  [temp_dir_path] * len(frames)),
+#             total=len(frames)
+#         ))
+
+#     # Merge results in order
+#     results = []
+#     for idx in range(len(frames)):
+#         temp_path = os.path.join(temp_dir_path, f"{idx}.json")
+#         if os.path.exists(temp_path):
+#             with open(temp_path, "r", encoding="utf-8") as f:
+#                 results.append(json.load(f))
+
+#     # Write final JSON
+#     with open(cache_path, "w", encoding="utf-8") as f:
+#         json.dump(results, f, ensure_ascii=False, indent=2)
+
+#     print(f"Saved final OCR results to {cache_path}")
+
+#     # Optional: cleanup temp files
+#     shutil.rmtree(temp_dir_path, ignore_errors=True)
+
+#     # Ensure results are in the same order as frames
+#     results.sort(key=lambda x: x["frame_index"])  # Ensure order by frame index
+#     return results
+
+
+#     # try:
+#     #     raw = ocr.ocr(fp)
+#     #     tabs = extract_texts_and_boxes(raw)
+#     #     return {
+#     #         "frame_index": idx,
+#     #         "frame_filename": os.path.basename(fp),
+#     #         "texts": [t[0] for t in tabs],
+#     #         "boxes": [t[1] for t in tabs],
+#     #         "scores": [t[2] for t in tabs]
+#     #     }
+#     # except Exception:
+#     #     return {
+#     #         "frame_index": idx,
+#     #         "frame_filename": os.path.basename(fp),
+#     #         "texts": [],
+#     #         "boxes": [],
+#     #         "scores": []
+#     #     }
+
+
+
+# def run_or_load_ocr_ordered(frames: List[str], ocr: PaddleOCR, cache_path: str) -> List[Dict]:
+#     if os.path.exists(cache_path):
+#         print(f"Loading OCR cache: {cache_path}")
+#         with open(cache_path, "r", encoding="utf8") as f:
+#             return json.load(f)
+#     print("Running OCR on all frames (ordered)...")
+#     res = []
+#     # offset = 0
+#     # frames = frames[offset+1:len(frames)]
+#     with open(cache_path, "w", encoding="utf8") as f:
+#         f.write("[\n")
+#         for idx, fp in enumerate(tqdm(frames)):
+#             current = {}
+#             try:
+#                 raw = ocr.ocr(fp)
+#                 tabs = extract_texts_and_boxes(raw)
+#                 current = {
+#                     "frame_index": idx,
+#                     "frame_filename": os.path.basename(fp),
+#                     "texts": [t[0] for t in tabs],
+#                     "boxes": [t[1] for t in tabs],
+#                     "scores": [t[2] for t in tabs]
+#                 }
+#                 res.append(current)
+#             except Exception as e:
+#                 current = {
+#                     "frame_index": idx,
+#                     "frame_filename": os.path.basename(fp),
+#                     "texts": [],
+#                     "boxes": [],
+#                     "scores": []
+#                 }
+#                 res.append(current)
+#             if idx < len(frames) - 1:
+#                     f.write(json.dumps(current, ensure_ascii=False) + ",\n")
+#             else:
+#                     f.write(json.dumps(current, ensure_ascii=False) )
+
+#         res.append(']\n')
+#         # json.dump(res, f, ensure_ascii=False, indent=2)
+#     return res
+
+
+
+
+
+# ============== UTILITIES ==============
+
+def load_frame_bgr(path: str) -> np.ndarray:
+    img = cv2.imread(path)
+    if img is None:
+        raise ValueError(f"Failed to read frame: {path}")
+    return img
+
+def to_gray(img_bgr: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+def expand_box(box: Tuple[int, int, int, int], w: int, h: int, pad: int = 8) -> Tuple[int, int, int, int]:
+    x, y, bw, bh = box
+    x2, y2 = x + bw, y + bh
+    x = max(0, x - pad)
+    y = max(0, y - pad)
+    x2 = min(w, x2 + pad)
+    y2 = min(h, y2 + pad)
+    return (x, y, x2 - x, y2 - y)
+
+def roi_change_score(prev_gray: np.ndarray, curr_gray: np.ndarray, boxes: List[Tuple[int,int,int,int]]) -> float:
+    """Average (1 - SSIM) across text ROIs. 0.0 ~ identical, 1.0 ~ very different."""
+    if prev_gray is None or curr_gray is None:
+        return 1.0
+    if not boxes:
+        return 1.0
+
+    h, w = prev_gray.shape[:2]
+    diffs = []
+
+    for (x, y, bw, bh) in boxes:
+        x, y, bw, bh = expand_box((x, y, bw, bh), w, h, pad=8)
+        if bw <= 0 or bh <= 0: 
+            continue
+
+        crop_prev = prev_gray[y:y+bh, x:x+bw]
+        crop_curr = curr_gray[y:y+bh, x:x+bw]
+        if crop_prev.size == 0 or crop_curr.size == 0:
+            continue
+
+        # Resize small crops to stabilize SSIM
+        if min(bw, bh) < 24:
+            crop_prev = cv2.resize(crop_prev, (max(24, bw), max(24, bh)))
+            crop_curr = cv2.resize(crop_curr, (max(24, bw), max(24, bh)))
+
+        s = ssim(crop_prev, crop_curr, data_range=255)
+        diffs.append(1.0 - float(s))
+
+    if not diffs:
+        return 1.0
+    return float(np.mean(diffs))
+
+
+# ============== CORE: PROCESS A FRAME WITH CHANGE DETECTION ==============
+
+def process_frame_change_detect(
+    idx: int,
+    fp: str,
+    ocr,
+    last_result: Optional[Dict],
+    last_gray: Optional[np.ndarray],
+    ssim_threshold: float,
+    force_refresh_every: int
+) -> Tuple[Dict, np.ndarray, Dict]:
+    """
+    Returns:
+      result: Dict saved per-frame
+      curr_gray: grayscale of current frame (for next comparison)
+      result_for_next: the OCR result that becomes "last_result" for next frame
+    """
+    img = load_frame_bgr(fp)
+    gray = to_gray(img)
+
+    must_refresh = (
+        last_result is None or
+        last_gray is None or
+        (force_refresh_every > 0 and idx % force_refresh_every == 0)
+    )
+
+    if not must_refresh:
+        # Compare current frame ROIs with last OCR'ed frame ROIs
+        boxes = last_result.get("boxes", [])
+        change = roi_change_score(last_gray, gray, boxes)
+
+        if change < ssim_threshold:
+            # Reuse previous OCR result (copy, update index/filename)
+            reused = dict(last_result)
+            reused["frame_index"] = idx
+            reused["frame_filename"] = os.path.basename(fp)
+            reused["_reused"] = True
+            return reused, gray, last_result  # last_result unchanged
+
+    # Text changed OR forced refresh -> run OCR
+    raw = ocr.ocr(fp)
+    tabs = extract_texts_and_boxes(raw)
+    fresh = {
+        "frame_index": idx,
+        "frame_filename": os.path.basename(fp),
+        "texts": [t[0] for t in tabs],
+        "boxes": [t[1] for t in tabs],
+        "scores": [t[2] for t in tabs]
+    }
+    return fresh, gray, fresh
+
+
+# ============== PUBLIC API ==============
+
+def run_or_load_ocr_ordered(
+    frames: List[str],
+    ocr,
+    cache_path: str,
+    temp_dir_path: str,
+    ssim_threshold: float = 0.08,
+    force_refresh_every: int = 240  # ~10s at 24 fps; set 0 to disable
+) -> List[Dict]:
+    """
+    Process frames sequentially with text-change detection.
+    Writes temp JSONs per frame, then consolidates into cache_path on success.
+    """
+    if os.path.exists(cache_path):
+        print(f"Loading OCR cache: {cache_path}")
+        with open(cache_path, "r", encoding="utf8") as f:
+            return json.load(f)
+
+    print("Running OCR with change-detection (sequential, temp writes)…")
+    os.makedirs(temp_dir_path, exist_ok=True)
+
+    results: List[Dict] = []
+    last_result: Optional[Dict] = None
+    last_gray: Optional[np.ndarray] = None
+
+    for idx, fp in tqdm(list(enumerate(frames)), total=len(frames)):
+        temp_path = os.path.join(temp_dir_path, f"{idx}.json")
+        if os.path.exists(temp_path):
+            # If a temp exists, load it AND also update last_result/last_gray for continuity.
+            with open(temp_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            results.append(saved)
+            # Reconstruct last_gray if possible; if not, set None so next frame forces refresh.
+            try:
+                # Only reload current frame as gray if it was a fresh OCR (optional but safer)
+                if not saved.get("_reused", False):
+                    img = load_frame_bgr(fp)
+                    last_gray = to_gray(img)
+                    last_result = saved
+            except Exception:
+                last_gray = None
+            continue
+
+        try:
+            result, curr_gray, last_for_next = process_frame_change_detect(
+                idx=idx,
+                fp=fp,
+                ocr=ocr,
+                last_result=last_result,
+                last_gray=last_gray,
+                ssim_threshold=ssim_threshold,
+                force_refresh_every=force_refresh_every
+            )
+        except Exception:
+            print(f"Error processing frame {idx} ({fp}): {sys.exc_info()[1]}")
+            result = {
+                "frame_index": idx,
+                "frame_filename": os.path.basename(fp),
+                "texts": [],
+                "boxes": [],
+                "scores": []
+            }
+            curr_gray = None
+            last_for_next = last_result  # keep old state on failure
+
+        # Save per-frame JSON immediately
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False)
+
+        results.append(result)
+        last_result = last_for_next
+        last_gray = curr_gray
+
+    # Final ordered JSON
+    results.sort(key=lambda x: x["frame_index"])
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    print(f"Saved final OCR results to {cache_path}")
+
+    # Optional cleanup
+    shutil.rmtree(temp_dir_path, ignore_errors=True)
+    return results
+
+
+
+# =========================
+# Sessioning (handle canvas clears)
+# =========================
+def segment_sessions(ocr_results: List[Dict], min_empty_gap=2) -> List[Tuple[int,int]]:
+    """
+    Split into sessions separated by >= min_empty_gap empty frames.
+    """
+    N = len(ocr_results)
+    sessions = []
+    i = 0
+    def empty(i): return len(" ".join(ocr_results[i]["texts"]).strip()) == 0
+
+    while i < N:
+        while i < N and empty(i): i += 1
+        if i >= N: break
+        start = i
+        j = i
+        while j < N:
+            if empty(j):
+                k = j + 1
+                gap = 1
+                while k < N and empty(k):
+                    gap += 1; k += 1
+                if gap >= min_empty_gap:
+                    end = j - 1
+                    if end < start: end = start
+                    sessions.append((start, end))
+                    i = k
+                    break
+            j += 1
+        if j >= N:
+            sessions.append((start, N-1))
+            i = N
+    return sessions
+
+# =========================
+# Stable ranges inside a session & final phrase
+# =========================
+def extract_stable_ranges_in_session(ocr_results: List[Dict], s: int, e: int) -> List[Dict]:
+    """
+    Returns ranges covering all frames: [{start_frame, end_frame, text, stable}]
+    """
+    out = []
+    if s > e: return out
+    def txt(i): return " ".join(ocr_results[i]["texts"]).strip()
+    cur = txt(s); start = s; stable = 1
+    for i in range(s+1, e+1):
+        t = txt(i)
+        if t == cur:
+            stable += 1
+        else:
+            out.append({"start_frame": start, "end_frame": i-1, "text": cur, "stable": stable})
+            cur = t; start = i; stable = 1
+    out.append({"start_frame": start, "end_frame": e, "text": cur, "stable": stable})
+    return out
+
+def pick_final_stable_phrase(ranges: List[Dict], min_stable_frames=2) -> Dict:
+    """
+    Pick last non-empty, sufficiently-stable phrase in these ranges.
+    """
+    final = None
+    for r in ranges:
+        if r["text"] and r["stable"] >= min_stable_frames:
+            final = r
+    return final
+
+# =========================
+# Translation (with cache)
+# =========================
+def load_translation_cache(path: str) -> Dict[str,str]:
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf8") as f:
+            return json.load(f)
+    return {}
+
+def save_translation_cache(cache: Dict[str,str], path: str):
+    with open(path, "w", encoding="utf8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+def translate_texts(texts: List[str], target_lang: str) -> List[str]:
+    """
+    Gemini translate. Requires env var GEMINI_API_KEY (or set up however you like).
+    If not available, returns identity translations.
+    """
+    if not texts:
+        return []
+    if not _GENAI_AVAILABLE:
+        return texts[:]  # fallback: identity
+    key = GEMINI_API_KEY
+    if not key:
+        return texts[:]  # fallback: identity
+    client = genai.Client(api_key=key)
+    outs = []
+    for t in texts:
+        prompt = f"Translate the following text to {target_lang}. Do not translate digits, if no translation found return empty string, find appropritate translations for short form whenever possible. Reply ONLY with the translation:\n\n{t}"
+        try:
+            resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+            outs.append(resp.text.strip())
+        except Exception as e:
+            print("Translate error:", e)
+            outs.append(t)
+    return outs
+
+def translate_final_phrase_with_cache(en_phrase: str, target_lang: str, cache_path: str) -> str:
+    cache = load_translation_cache(cache_path)
+    if en_phrase in cache:
+        return cache[en_phrase]
+    gu = translate_texts([en_phrase], target_lang)[0]
+    cache[en_phrase] = gu
+    save_translation_cache(cache, cache_path)
+    return gu
+
+# =========================
+# Word timelines (start: first ANY-char match; end: final stable end)
+# =========================
+def word_timelines_for_final_phrase(ocr_results: List[Dict], session_ranges: List[Dict],
+                                    final_range: Dict, final_phrase: str) -> List[Dict]:
+    """
+    Returns [{en_word, start_frame, end_frame}]
+    """
+    if not session_ranges: return []
+    s0 = session_ranges[0]["start_frame"]
+    se = final_range["end_frame"]
+    words = final_phrase.split()
+
+    # map char index in final_phrase -> word index (spaces map to previous word)
+    char2word = []
+    for wi, w in enumerate(words):
+        for _ in w: char2word.append(wi)
+        if wi < len(words) - 1:
+            char2word.append(wi)
+
+    def cur_text(i): return " ".join(ocr_results[i]["texts"]).strip()
+
+    first_char_frame = [None]*len(words)
+    prev = ""
+    for i in range(s0, se+1):
+        curr = cur_text(i)
+        lcp = 0
+        m = min(len(curr), len(final_phrase))
+        while lcp < m and curr[lcp] == final_phrase[lcp]:
+            lcp += 1
+        prev_lcp = 0
+        mp = min(len(prev), len(final_phrase))
+        while prev_lcp < mp and prev[prev_lcp] == final_phrase[prev_lcp]:
+            prev_lcp += 1
+        if lcp > prev_lcp:
+            for cidx in range(prev_lcp, lcp):
+                if 0 <= cidx < len(char2word):
+                    wi = char2word[cidx]
+                    if first_char_frame[wi] is None:
+                        first_char_frame[wi] = i
+        prev = curr
+
+    for wi in range(len(words)):
+        if first_char_frame[wi] is None:
+            first_char_frame[wi] = final_range["start_frame"]
+
+    return [{"en_word": w, "start_frame": first_char_frame[wi], "end_frame": se}
+            for wi, w in enumerate(words)]
+
+# =========================
+# Map words → boxes (approx per-word from line box)
+# =========================
+def find_line_box_containing_word(english_lines: List[str], boxes: List[Tuple[int,int,int,int]], word: str):
+    for lt, bx in zip(english_lines, boxes):
+        if word in lt:
+            return lt, bx
+    return None, None
+
+def split_line_box_to_word_box(line_text: str, line_box: Tuple[int,int,int,int], word: str):
+    x1,y1,x2,y2 = line_box
+    if not line_text: return line_box
+    idx = line_text.find(word)
+    if idx < 0: return line_box
+    L = max(1, len(line_text))
+    start_frac = idx / L
+    end_frac = (idx + len(word)) / L
+    wx1 = int(x1 + (x2 - x1) * start_frac)
+    wx2 = int(x1 + (x2 - x1) * end_frac)
+    return (wx1, y1, wx2, y2)
+
+def map_words_to_boxes_at_frame(ocr_results: List[Dict], frame_idx: int, final_phrase: str):
+    lines = ocr_results[frame_idx]["texts"]
+    boxes = ocr_results[frame_idx]["boxes"]
+    out = []
+    for w in final_phrase.split():
+        lt, lb = find_line_box_containing_word(lines, boxes, w)
+        if lb is None:
+            if boxes:
+                lt, lb = (lines[0], boxes[0])
+            else:
+                out.append((w, None)); continue
+        wb = split_line_box_to_word_box(lt, lb, w)
+        out.append((w, wb))
+    return out
+
+# =========================
+# Overlay drawing
+# =========================
+def pick_font():
+    for p in DEFAULT_FONT_PATHS:
+        if os.path.exists(p): return p
+    return None
+
+def overlay_gu_words_on_frame(frame_path: str, word_overlays: List[Tuple[str, Tuple[int,int,int,int]]],
+                              font_path=None, bg_rgba=BG_RGBA) -> PILImage:
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    img = Image.open(frame_path).convert("RGBA")
+    lay = img # Image.new("RGBA", img.size, (0,100,0,255)) this overlay entire green screenavoid if possible
+    draw = ImageDraw.Draw(lay)
+
+    font_path = font_path or pick_font()
+    if font_path:
+        try:
+            # size will be chosen per box below
+            base_font = lambda h: ImageFont.truetype(font_path, size=max(18, h//2))
+        except:
+            base_font = lambda h: ImageFont.load_default()
+    else:
+        base_font = lambda h: ImageFont.load_default()
+
+    for gu, box in word_overlays:
+        if not box or not gu: continue
+        x1,y1,x2,y2 = box
+        # background
+        bg = Image.new("RGBA", (max(1,x2-x1), max(1,y2-y1)), bg_rgba)
+        img.alpha_composite(bg, dest=(x1,y1))
+        # text
+        font = base_font(max(1, y2-y1))
+        draw.text((x1, y1), gu, fill=(255,255,255,255), font=font)
+
+    out = Image.alpha_composite(img, lay).convert("RGB")
+    return out
+
+
+# =========================
+# Audio helper
+# =========================
+def extract_audio(input_video: str, out_audio: str):
+    clip = AudioFileClip(input_video)
+    clip.write_audiofile(out_audio)
+    clip.close()
+    return out_audio
+
+def prep_board(img_bgr):
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    # mask likely board (tune bounds for your green)
+    lower = (35, 30, 30); upper = (90, 255, 255)
+    mask = cv2.inRange(hsv, lower, upper)
+    inv = cv2.bitwise_not(mask)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(gray)
+    thr = cv2.adaptiveThreshold(clahe,255,cv2.ADAPTIVE_THRESH_MEAN_C,
+                                cv2.THRESH_BINARY, 35, 5)
+    # Keep bright strokes over darker board
+    fg = cv2.bitwise_and(thr, thr, mask=inv)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(1,1))
+    fg = cv2.dilate(fg, kernel, 1)
+    return fg
+
+def run_mmocr_ocr_ordered(frame):
+    """
+    Runs OCR on frames and saves results to cache.
+    If cache exists, loads from it.
+    """
+
+    infer = TextInferencer(det='dbnet', rec='svtr-base')
+    # infer = TextInferencer(
+    #     det='dbnet_resnet18_fpnc_1200e_icdar2015',
+    #     rec='sar_resnet31_parallel_decoder_5e',
+    #     device='cpu'
+    # )
+
+    out = infer(frame, return_vis=True)
+    return {
+        "result": {
+            "0": {
+                'json': {
+                    "rec_texts": out['rec_texts'],  # recognized texts
+                    "rec_boxes": out['det_polygons'],  # detection boxes
+                    "rec_scores": out['rec_scores']  # recognition scores       
+                }
+            }
+        }
+    }
+# =========================
+# Main orchestration
+# =========================
+def main(input_video: str, output_folder: str, target_lang: str = "gu"):
+
+    video_name = os.path.splitext(os.path.basename(input_video))[0]
+    out_dir = os.path.join(output_folder, f"{video_name}-{target_lang}")
+    temp_out_dir = os.path.join(out_dir, "ocr_temp")
+    frames_dir = os.path.join(out_dir, "frames")
+    overlay_frames_dir = os.path.join(out_dir, "overlay_frames")
+    os.makedirs(overlay_frames_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 1) Frames
+    frames = extract_frames(input_video, frames_dir, fps=OUTPUT_FPS)
+
+    # 2) OCR ordered + cache
+    ocr = PaddleOCR( use_angle_cls=True,   # detects & corrects text rotation
+    lang='en',            # English model
+    det_model_dir=None,   # default text detection model
+    rec_model_dir=None )
+    ocr_cache = os.path.join(out_dir, "ocr_results_ordered.json")
+    # ocr_results = run_or_load_ocr_ordered(frames, ocr, ocr_cache, temp_out_dir)
+    ocr_results = run_or_load_ocr_ordered(
+    frames,
+    ocr,
+    ocr_cache,
+    temp_out_dir,
+    0.08,
+    200  # ~10s at 20 fps; set 0 to disable
+)
+    # 3) Sessions (handle clears)
+    sessions = segment_sessions(ocr_results, min_empty_gap=2)
+
+    overlayed_paths = []
+
+    for (s,e) in sessions:
+        # Cover every frame in session
+        ranges = extract_stable_ranges_in_session(ocr_results, s, e)
+        final_range = pick_final_stable_phrase(ranges, min_stable_frames=2)
+
+        if not final_range:
+            # nothing meaningful: copy frames as-is
+            for idx in range(s, e+1):
+                outp = os.path.join(overlay_frames_dir, os.path.basename(frames[idx]))
+                shutil.copy(frames[idx], outp)
+                overlayed_paths.append(outp)
+            continue
+
+        final_phrase = final_range["text"]
+
+        # 4) Translate w/ cache
+        cache_path = os.path.join(out_dir, "translations_cache.json")
+        gu_phrase = translate_final_phrase_with_cache(final_phrase, target_lang, cache_path)
+
+        # 5) Word timelines
+        timelines = word_timelines_for_final_phrase(ocr_results, ranges, final_range, final_phrase)
+
+        # 6) Map words -> boxes (use final stable frame for best geometry)
+        en_boxes = map_words_to_boxes_at_frame(ocr_results, final_range["end_frame"], final_phrase)
+        en2box = {w: bx for (w,bx) in en_boxes}
+
+        # 7) Align words by order (simple & robust for many cases)
+        en_words = final_phrase.split()
+        gu_words = gu_phrase.split()
+        pairs = list(zip(en_words, gu_words[:len(en_words)]))
+
+        # 8) Per-frame overlays across [s,e]
+        for idx in range(s, e+1):
+            word_overlays = []
+            for (en_w, gu_w) in pairs:
+                tl = next(t for t in timelines if t["en_word"] == en_w)
+                if idx < tl["start_frame"]:
+                    frag = ""
+                elif idx >= tl["end_frame"]:
+                    frag = gu_w
+                else:
+                    # progressive reveal within word window
+                    denom = max(1, tl["end_frame"] - tl["start_frame"] + 1)
+                    progress = (idx - tl["start_frame"] + 1) / denom
+                    chars = max(1, math.ceil(len(gu_w) * progress))
+                    frag = gu_w[:chars]
+                box = en2box.get(en_w)
+                word_overlays.append((frag, box))
+
+            img = overlay_gu_words_on_frame(frames[idx], word_overlays, bg_rgba=BG_RGBA)
+            outp = os.path.join(overlay_frames_dir, os.path.basename(frames[idx]))
+            img.save(outp)
+            overlayed_paths.append(outp)
+
+    # 9) Audio + stitch
+    audio_path = os.path.join(out_dir, "audio.mp3")
+    extract_audio(input_video, audio_path)
+
+    print("Re-assembling video with overlays and original audio...")
+    clip = ImageSequenceClip(overlayed_paths, fps=OUTPUT_FPS)
+    audio_clip = AudioFileClip(audio_path)
+    clip_with_audio = clip.with_audio(audio_clip)
+    out_video = os.path.join(out_dir, f"{video_name}_{target_lang}_overlay.mp4")
+    clip_with_audio.write_videofile(out_video, codec="libx264", audio_codec="aac")
+    clip.close(); audio_clip.close()
+
+    print("Done:", out_video)
+
+# =========================
+# CLI
+# =========================
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser("Blackboard OCR → Indic overlay (phrase-aware, per-word progressive)")
+    ap.add_argument("input_video", help="Path to input .mp4")
+    ap.add_argument("output_folder", help="Folder to write outputs")
+    ap.add_argument("--lang", default="gu", help="Target Indic language code (default: gu)")
+    args = ap.parse_args()
+    main(args.input_video, args.output_folder, target_lang=args.lang)

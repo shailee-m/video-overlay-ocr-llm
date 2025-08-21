@@ -1,0 +1,16 @@
+opencv-python
+paddleocr
+pillow
+moviepy
+requests
+tqdm
+paddlepaddle
+setuptools
+google-genai
+opencv-python
+torch 
+torchvision --index-url https://download.pytorch.org/whl/cpu
+mmengine
+mmcv
+mmocr
+mmdet
