@@ -49,6 +49,7 @@ try:
     from mmocr.apis import MMOCRInferencer as MMOCRInferencer
 except Exception:
     MMOCRInferencer = None
+from skimage.metrics import structural_similarity as ssim
 
 # Video mux
 from moviepy import ImageSequenceClip, AudioFileClip
@@ -68,16 +69,19 @@ OUTPUT_IMAGE_EXT = ".png"
 MAX_WORKERS = max(1, os.cpu_count() or 1)
 
 # Overlay appearance
-BG_RGBA = (0, 0, 0, 150)  # translucent black background for overlay text
+BG_RGBA = (0, 0, 0, 255)  # translucent black background for overlay text
 PAD_X = 6                 # horizontal padding inside bbox for text
 PAD_Y = 3                 # vertical padding inside bbox for text
 TEXT_MAX_W_FRAC = 0.98    # leave a tiny margin inside the box
 
 # Fonts — adjust paths for your machine
 DEFAULT_FONT_PATHS = [
-    "/usr/share/fonts/truetype/noto/NotoSansGujarati-Regular.ttf",  # Gujarati example
-    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansGujarati-Regular.ttf",  # Gujarati
+    "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf", # symbols, math
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",         # Latin fallback
+    # "/usr/share/fonts/truetype/noto/NotoSansGujarati-Regular.ttf",  # Gujarati example
+    # "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+    # "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
 ]
 GEMINI_API_KEY = ""  # Replace with your actual Gemini API Key
 
@@ -87,6 +91,17 @@ GEMINI_API_KEY = ""  # Replace with your actual Gemini API Key
 # =========================
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
+
+def get_font_for_text(text, size):
+    for font_path in DEFAULT_FONT_PATHS:
+        try:
+            font = ImageFont.truetype(font_path, size=size)
+            if all(font.getmask(c).getbbox() for c in text):
+                return font
+        except:
+            continue
+    return ImageFont.load_default()
+
 
 def list_frames_sorted(frames_dir: str) -> List[str]:
     # Sort by numeric name if available; else lexicographic
@@ -110,6 +125,10 @@ def draw_text_fit(draw: ImageDraw.ImageDraw, text: str, bbox: Tuple[int,int,int,
     h = max(1, y2 - y1)
     # bg
     draw.rectangle([x1, y1, x2, y2], fill=BG_RGBA)
+    # max(18, h//2)
+    # base_font = get_font_for_text
+    # font = base_font(text, max(1, y2-y1))
+    
 
     if not text.strip():
         return
@@ -137,6 +156,7 @@ def draw_text_fit(draw: ImageDraw.ImageDraw, text: str, bbox: Tuple[int,int,int,
     tw, th = text_size(font)
     while (tw > TEXT_MAX_W_FRAC * (w - 2 * PAD_X)) and size > 10:
         size -= 1
+        # font = base_font(text, max(1, size))
         if font_path and os.path.exists(font_path):
             font = ImageFont.truetype(font_path, size=size)
         else:
@@ -759,12 +779,13 @@ def overlay_words_on_frame(img_path: str, overlays: List[Tuple[str, Tuple[int,in
     overlays: List of (text, box)
     """
     base = Image.open(img_path).convert("RGBA")
-    lay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    lay = Image.new("RGBA", base.size, (0, 0, 0, 255))
     draw = ImageDraw.Draw(lay)
 
     for text, box in overlays:
         if not box:
             continue
+        # get_font_for_text(word, h)
         draw_text_fit(draw, text or "", box, font_path)
 
     out = Image.alpha_composite(base, lay).convert("RGB")
@@ -781,9 +802,6 @@ def main(input_video: str, out_dir: str, target_lang: str = "gu", ocr_engine: st
     frames_dir = os.path.join(output_folder, "frames")
     overlay_dir = os.path.join(output_folder, "overlay_frames")
     ocr_cache_dir = os.path.join(output_folder, "ocr_cache")
-    ensure_dir(frames_dir)
-    ensure_dir(overlay_dir)
-    ensure_dir(ocr_cache_dir)
 
     # 1) Frames
     frames, fps, (W, H) = extract_frames(input_video, frames_dir)
@@ -900,6 +918,7 @@ def main(input_video: str, out_dir: str, target_lang: str = "gu", ocr_engine: st
 
     # 7) Overlay per-frame
     print("[INFO] Rendering overlays...")
+    ensure_dir(overlay_dir)
     overlay_paths = []
     for idx, fp in enumerate(tqdm(frames, desc="Overlay")):
         overlays = []

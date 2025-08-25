@@ -14,3 +14,4 @@ mmengine
 mmcv
 mmocr
 mmdet
+scikit-image
